@@ -1,0 +1,299 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Protected App — Stronger Demo</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial; padding:18px;background:#f7fafc;}
+    #ui{max-width:820px;margin:28px auto;background:#fff;border-radius:10px;padding:18px;box-shadow:0 6px 22px rgba(0,0,0,.06)}
+    .hidden{display:none}
+    input,button{padding:10px;margin:8px 0;width:100%;box-sizing:border-box;border-radius:6px;border:1px solid #ddd}
+    pre{background:#f6f6f6;padding:10px;border-radius:6px;overflow:auto}
+    label{display:block;margin:8px 0}
+    #status{font-weight:600;margin-bottom:10px}
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <h2>Protected App — Stronger Client-Only Demo</h2>
+    <div id="status">Checking...</div>
+
+    <div id="prompt" class="hidden">
+      <p>This device is not authorized. Enter password to unlock:</p>
+      <input id="pw" type="password" placeholder="Password"/>
+      <button id="unlockBtn">Unlock</button>
+      <p><small>After successful unlock, you can choose to "remember this device".</small></p>
+      <label><input id="remember" type="checkbox"/> Remember this device</label>
+      <div id="unlockMsg" style="color:red"></div>
+    </div>
+
+    <div id="app" class="hidden">
+      <h3>App content decrypted and running</h3>
+      <div id="appOutput"></div>
+      <button id="forget">Forget this device</button>
+      <pre id="debug" class="hidden"></pre>
+    </div>
+
+    <hr/>
+    <p><strong>Note:</strong> This demo creates an encrypted payload in localStorage on first load using the demo password. For production: obfuscate/minify your code and pre-encrypt it during your build process — then embed the encrypted payload directly into the page rather than creating it at runtime.</p>
+  </div>
+
+<script>
+/* ---------- Utilities: base64 <-> ArrayBuffer ---------- */
+function b64Decode(s){ return Uint8Array.from(atob(s), c => c.charCodeAt(0)).buffer; }
+function b64Encode(buf){ const u=new Uint8Array(buf); let s=''; for(let i=0;i<u.length;i++) s+=String.fromCharCode(u[i]); return btoa(s); }
+function toUtf8(str){ return new TextEncoder().encode(str); }
+function fromUtf8(buf){ return new TextDecoder().decode(buf); }
+
+/* ---------- Stronger device fingerprint (more entropy) ---------- */
+function getDeviceFingerprint(){
+  const nav = navigator || {};
+  const screenInfo = [
+    screen.width || 0,
+    screen.height || 0,
+    screen.colorDepth || 0
+  ].join('x');
+  const parts = [
+    nav.userAgent || '',
+    nav.platform || '',
+    nav.language || '',
+    screenInfo,
+    nav.hardwareConcurrency || '',
+    Intl.DateTimeFormat().resolvedOptions().timeZone || ''
+  ];
+  return parts.join('||');
+}
+
+/* ---------- Crypto helpers (Web Crypto) ---------- */
+
+// derive AES-GCM app key from password + salt using PBKDF2 (SHA-512, many iterations)
+async function deriveAppKey(password, saltB64){
+  const salt = b64Decode(saltB64);
+  const pwKey = await crypto.subtle.importKey('raw', toUtf8(password), {name:'PBKDF2'}, false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey(
+    {name:'PBKDF2', salt, iterations: 500_000, hash: 'SHA-512'},
+    pwKey,
+    {name:'AES-GCM', length: 256},
+    true,
+    ['decrypt','encrypt']
+  );
+  return key;
+}
+
+// derive device key (AES-GCM) from fingerprint using PBKDF2 SHA-512
+async function deriveDeviceKey(){
+  const fp = getDeviceFingerprint();
+  // Use constant salt for device derivation but long enough
+  const salt = toUtf8('device-salt-v2-please-change-if-needed');
+  const base = await crypto.subtle.importKey('raw', toUtf8(fp), {name:'PBKDF2'}, false, ['deriveKey']);
+  const dev = await crypto.subtle.deriveKey(
+    {name:'PBKDF2', salt, iterations: 250_000, hash:'SHA-512'},
+    base,
+    {name:'AES-GCM', length: 256},
+    true,
+    ['encrypt','decrypt']
+  );
+  return dev;
+}
+
+// AES-GCM decrypt (expects base64 iv and data)
+async function aesGcmDecrypt(key, ivB64, dataB64){
+  const iv = b64Decode(ivB64);
+  const data = b64Decode(dataB64);
+  const plain = await crypto.subtle.decrypt({name:'AES-GCM', iv:new Uint8Array(iv)}, key, data);
+  return fromUtf8(plain);
+}
+async function aesGcmEncrypt(key, plaintext){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, toUtf8(plaintext));
+  return {iv: b64Encode(iv.buffer), data: b64Encode(enc)};
+}
+
+/* ---------- Encrypted payload (salt, iv, data) ---------- */
+let ENCRYPTED_PAYLOAD = { salt: "", iv: "", data: "" };
+
+/* ---------- Storage keys ---------- */
+const STORAGE_WRAPPED_KEY = 'protected_wrappedKey_v2';
+const STORAGE_PAYLOAD = 'protected_payload_v2';
+const STORAGE_CREATED = 'created_demo_payload_v2';
+
+/* ---------- Create demo encrypted payload (first-run only) ---------- */
+/* In production: create and embed your encrypted payload at build-time and don't recreate at runtime. */
+async function createEncryptedPayload(password, rawCode){
+  // longer salt (32 bytes)
+  const salt = crypto.getRandomValues(new Uint8Array(32));
+  const saltB64 = b64Encode(salt.buffer);
+  const appKey = await deriveAppKey(password, saltB64);
+  const encrypted = await aesGcmEncrypt(appKey, rawCode);
+  return {salt: saltB64, iv: encrypted.iv, data: encrypted.data};
+}
+
+/* ---------- Helper: create a demo payload if not present ---------- */
+async function ensurePayloadExists(){
+  // If payload already exists in memory or localStorage, use it
+  if(ENCRYPTED_PAYLOAD.salt) return;
+  // Check localStorage for persisted payload
+  const stored = localStorage.getItem(STORAGE_CREATED);
+  if(stored){
+    try{
+      const obj = JSON.parse(stored);
+      ENCRYPTED_PAYLOAD = obj;
+      return;
+    }catch(e){}
+  }
+
+  // DEMO: raw app code to protect. Replace this string with your real (preferably obfuscated/minified) app code.
+  const rawAppCode = `
+    (function(){
+      // ====== Protected application code (demo) ======
+      // In production, obfuscate & minify this before encrypting.
+      const now = new Date().toLocaleString();
+      document.getElementById('appOutput').innerText = "Hello — decrypted app running. Time: " + now;
+      return "Decrypted OK";
+    })();
+  `;
+
+  // DEMO PASSWORD supplied by user (embedded here because you are not using a server)
+  const demoPassword = "@Shruti.0143";
+
+  // Create encrypted payload and persist (so the demo is consistent across reloads)
+  const payload = await createEncryptedPayload(demoPassword, rawAppCode);
+  ENCRYPTED_PAYLOAD = payload;
+  localStorage.setItem(STORAGE_CREATED, JSON.stringify(payload));
+}
+
+/* ---------- Auto-unwrap flow: try to decrypt stored wrapped key using device key ---------- */
+async function tryAutoUnlock(){
+  const wrappedB64 = localStorage.getItem(STORAGE_WRAPPED_KEY);
+  if(!wrappedB64) return false;
+  try{
+    const devKey = await deriveDeviceKey();
+    const wrappedBuf = b64Decode(wrappedB64);
+    const wrappedArr = new Uint8Array(wrappedBuf);
+    const iv = wrappedArr.slice(0,12).buffer;
+    const cipher = wrappedArr.slice(12).buffer;
+    // decrypt exported raw app key
+    const exportedRawKey = await crypto.subtle.decrypt({name:'AES-GCM', iv:new Uint8Array(iv)}, devKey, cipher);
+    // import raw as AES-GCM key
+    const appKey = await crypto.subtle.importKey('raw', exportedRawKey, {name:'AES-GCM'}, true, ['decrypt','encrypt']);
+    // payload could be stored separately; we saved the created payload earlier
+    const payloadJson = localStorage.getItem(STORAGE_PAYLOAD) || localStorage.getItem(STORAGE_CREATED);
+    if(!payloadJson) return false;
+    const p = JSON.parse(payloadJson);
+    const decrypted = await aesGcmDecrypt(appKey, p.iv, p.data);
+    // success: run decrypted code
+    runDecryptedCode(decrypted);
+    return true;
+  }catch(e){
+    console.warn("Auto-unwrap failed:", e);
+    return false;
+  }
+}
+
+/* ---------- Wrap & store app key (when "remember" is checked) ---------- */
+async function wrapAndStoreAppKey(appKey, payloadObject){
+  // export raw app key
+  const raw = await crypto.subtle.exportKey('raw', appKey);
+  const devKey = await deriveDeviceKey();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = await crypto.subtle.encrypt({name:'AES-GCM', iv}, devKey, raw);
+  // store iv + cipher
+  const compound = new Uint8Array(iv.byteLength + cipher.byteLength);
+  compound.set(iv, 0);
+  compound.set(new Uint8Array(cipher), iv.byteLength);
+  localStorage.setItem(STORAGE_WRAPPED_KEY, b64Encode(compound.buffer));
+  // also store payload so unwrap can work without rebuilding payload
+  localStorage.setItem(STORAGE_PAYLOAD, JSON.stringify(payloadObject));
+}
+
+/* ---------- Unlock with provided password ---------- */
+async function unlockWithPassword(password, rememberDevice){
+  try{
+    const appKey = await deriveAppKey(password, ENCRYPTED_PAYLOAD.salt);
+    const decrypted = await aesGcmDecrypt(appKey, ENCRYPTED_PAYLOAD.iv, ENCRYPTED_PAYLOAD.data);
+    if(rememberDevice){
+      await wrapAndStoreAppKey(appKey, ENCRYPTED_PAYLOAD);
+    } else {
+      localStorage.removeItem(STORAGE_WRAPPED_KEY);
+      localStorage.removeItem(STORAGE_PAYLOAD);
+    }
+    runDecryptedCode(decrypted);
+    return true;
+  }catch(e){
+    console.error("Unlock failed:", e);
+    return false;
+  }
+}
+
+/* ---------- Run the decrypted code (safer than eval) ---------- */
+function runDecryptedCode(codeStr){
+  document.getElementById('status').innerText = 'Unlocked';
+  document.getElementById('prompt').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  try{
+    // Avoid eval; use Function constructor (still executes JS but less accidental context leakage)
+    const fn = new Function(codeStr);
+    const result = fn();
+    if(result !== undefined){
+      document.getElementById('appOutput').innerText = String(result);
+    }
+  }catch(e){
+    console.error("Error running decrypted code:", e);
+    document.getElementById('appOutput').innerText = 'Error running app: ' + e.message;
+  }
+}
+
+/* ---------- UI wiring ---------- */
+document.getElementById('unlockBtn').addEventListener('click', async ()=>{
+  const pw = document.getElementById('pw').value || '';
+  document.getElementById('unlockMsg').innerText = '';
+  if(!pw){
+    document.getElementById('unlockMsg').innerText = 'Enter password';
+    return;
+  }
+  const remember = document.getElementById('remember').checked;
+  document.getElementById('status').innerText = 'Trying password...';
+  const ok = await unlockWithPassword(pw, remember);
+  if(!ok){
+    document.getElementById('unlockMsg').innerText = 'Wrong password or decryption failed.';
+    document.getElementById('status').innerText = 'Locked';
+  }
+});
+
+document.getElementById('forget').addEventListener('click', ()=>{
+  localStorage.removeItem(STORAGE_WRAPPED_KEY);
+  localStorage.removeItem(STORAGE_PAYLOAD);
+  document.getElementById('status').innerText = 'Forgot device. Reload to re-lock.';
+});
+
+/* ---------- Anti-copy / small hurdles (cosmetic; not foolproof) ---------- */
+(function antiCopyHurdles(){
+  document.addEventListener('contextmenu', e => e.preventDefault());
+  document.addEventListener('selectstart', e => e.preventDefault());
+  window.addEventListener('keydown', e => {
+    // block common devtool shortcuts (not foolproof)
+    if(e.ctrlKey && (e.key === 'u' || e.key === 'U' || e.key === 's')) e.preventDefault();
+    if(e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J')) e.preventDefault();
+    if(e.key === 'F12') e.preventDefault();
+  });
+})();
+
+/* ---------- Initialization ---------- */
+(async function init(){
+  await ensurePayloadExists(); // create demo payload (first-run) using demo password @Shruti.0143
+
+  // Try auto-unwrap
+  const autoOk = await tryAutoUnlock();
+  if(autoOk){
+    document.getElementById('status').innerText = 'Auto-unlocked (this device remembered).';
+    return;
+  }
+
+  // else prompt for password
+  document.getElementById('status').innerText = 'Locked: password required';
+  document.getElementById('prompt').classList.remove('hidden');
+})();
+</script>
+</body>
+</html>
