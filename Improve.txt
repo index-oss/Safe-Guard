@@ -1,0 +1,13 @@
+PBKDF2 now uses SHA-512 and 500,000 iterations (much stronger key derivation).
+
+Salt length increased to 32 bytes.
+
+Device fingerprint includes extra entropy (screen, colorDepth, locale, timezone, hardwareConcurrency).
+
+Device-key derivation uses PBKDF2 (SHA-512) too.
+
+When a user checks “Remember this device” the app key is wrapped with the device key and stored (IV prefixed).
+
+Replaced eval with new Function(...)() to reduce surface for accidental use of eval.
+
+Added lightweight anti-copy / anti-devtools hurdles (disable right-click, selection, common devtool shortcuts) — not foolproof but raises the bar.
